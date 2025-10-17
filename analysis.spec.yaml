@@ -1,33 +1,278 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import json
+import argparse
+from typing import Any, Dict, List, Optional
+
+import yaml
+
+# Optional OpenAI client (pip install openai)
+try:
+    from openai import OpenAI
+    _OPENAI_AVAILABLE = True
+except Exception:
+    _OPENAI_AVAILABLE = False
+
+
+TEMPLATE_SPEC = """# Prompt: {prompt}
 run:
   out_dir: ./runs/aria_demo
   random_state: 42
   test_size: 0.2
   cv_folds: 5
-  task: regression   # or classification
-
+  task: regression
 data:
-  csv_path: data/housing.csv
+  csv_path: ./data/housing.csv
   target: house_price
-  features:
-    - rooms
-    - distance
-    - crime_rate
-    - age
-    - income
-    - school_score
-    - has_park
-    - near_subway
-    - city
-
+  features: [rooms, distance, crime_rate, age, income, school_score, has_park, near_subway, city]
 constraints:
-  allow_models: ["linear", "gbdt", "rf"]
+  allow_models: [linear, gbdt, rf]
   scale_numeric: true
   handle_unknown_category: ignore
-
 explainability:
-  permutation_importance:
-    enabled: true
-    n_repeats: 5
-
+  permutation_importance: {{enabled: true, n_repeats: 5}}
 deliverables:
-  artifacts: ["model.pkl","metrics.json","feature_importance.png","lineage.json","report.md"]
+  artifacts: [model.pkl, metrics.json, feature_importance.png, lineage.json, report.md]
+"""
+
+
+def _strip_code_fences(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    lines = [ln for ln in text.splitlines() if not ln.strip().startswith("```")]
+    return "\n".join(lines).strip()
+
+
+def _ensure_spec_shape(d: Dict[str, Any]) -> Dict[str, Any]:
+    # Ensure required top-level keys exist with sensible defaults
+    d = d or {}
+    d.setdefault("run", {})
+    d.setdefault("data", {})
+    d.setdefault("constraints", {})
+    d.setdefault("explainability", {"permutation_importance": {"enabled": True, "n_repeats": 5}})
+    d.setdefault("deliverables", {})
+    # Normalizations
+    if isinstance(d.get("run", {}).get("task"), str):
+        d["run"]["task"] = d["run"]["task"].lower().strip()
+    # Backfill minimal defaults
+    d["run"].setdefault("out_dir", "./runs/aria_demo")
+    d["run"].setdefault("random_state", 42)
+    d["run"].setdefault("test_size", 0.2)
+    d["run"].setdefault("cv_folds", 5)
+    d["run"].setdefault("task", "regression")
+    d["constraints"].setdefault("allow_models", ["linear", "gbdt", "rf"])
+    d["constraints"].setdefault("scale_numeric", True)
+    d["constraints"].setdefault("handle_unknown_category", "ignore")
+    d["deliverables"].setdefault(
+        "artifacts",
+        ["model.pkl", "metrics.json", "feature_importance.png", "lineage.json", "report.md"],
+    )
+    return d
+
+
+def _basic_validate_and_repair(d: Dict[str, Any]) -> Dict[str, Any]:
+    # Enforce allowed enums and field shapes
+    allowed_tasks = {"regression", "classification"}
+    if d["run"]["task"] not in allowed_tasks:
+        d["run"]["task"] = "regression"
+
+    allowed_models = {"linear", "gbdt", "rf", "xgboost", "lightgbm"}
+    allow_models = d["constraints"].get("allow_models", [])
+    if not isinstance(allow_models, list) or not allow_models:
+        allow_models = ["linear", "gbdt", "rf"]
+    allow_models = [m for m in allow_models if m in allowed_models]
+    if not allow_models:
+        allow_models = ["linear", "gbdt", "rf"]
+    d["constraints"]["allow_models"] = allow_models
+
+    # Data fields
+    d["data"].setdefault("csv_path", "./data/housing.csv")
+    d["data"].setdefault("target", "house_price")
+    feats = d["data"].get("features")
+    if not isinstance(feats, list) or not feats:
+        d["data"]["features"] = [
+            "rooms",
+            "distance",
+            "crime_rate",
+            "age",
+            "income",
+            "school_score",
+            "has_park",
+            "near_subway",
+            "city",
+        ]
+    else:
+        # Deduplicate and remove target if present
+        uniq = []
+        for f in feats:
+            if f not in uniq:
+                uniq.append(f)
+        d["data"]["features"] = [f for f in uniq if f != d["data"]["target"]]
+    return d
+
+
+def _csv_header(csv_path: str) -> Optional[List[str]]:
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_path, nrows=1)
+        return list(df.columns)
+    except Exception:
+        return None
+
+
+def _data_aware_checks(d: Dict[str, Any], csv_path_override: Optional[str] = None) -> List[str]:
+    messages: List[str] = []
+    csv_path = csv_path_override or d["data"].get("csv_path")
+    cols = _csv_header(csv_path) if csv_path else None
+    if cols is None:
+        messages.append(f"Warning: Could not read CSV header at {csv_path}. Skipping column checks.")
+        return messages
+
+    target = d["data"].get("target")
+    if target not in cols:
+        messages.append(f"Target not found in CSV columns: {target}")
+
+    missing = [f for f in d["data"]["features"] if f not in cols]
+    if missing:
+        messages.append(f"Missing features in CSV: {missing}")
+    return messages
+
+
+def _openai_client_or_none() -> Optional["OpenAI"]:
+    if not _OPENAI_AVAILABLE:
+        return None
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        return OpenAI()
+    except Exception:
+        return None
+
+
+def draft_spec_from_prompt(prompt: str, use_llm: bool = True) -> str:
+    """
+    Returns a YAML spec as a string. If use_llm=True and OpenAI is configured,
+    ask the model for YAML; else return a static template.
+    """
+    if use_llm:
+        client = _openai_client_or_none()
+        if client is not None:
+            system_msg = (
+                "You output ONLY YAML for a Spec with keys: run, data, constraints, "
+                "explainability, deliverables. No prose. Use sensible defaults if unsure. "
+                "Allowed values: task in {regression, classification}; handle_unknown_category in "
+                "{ignore, infrequent_if_exist, error}; allow_models subset of {linear, gbdt, rf, xgboost, lightgbm}."
+            )
+            user_msg = (
+                f"Draft a valid YAML Spec for this research intent: {prompt}. "
+                "Do not include markdown code fences; only YAML."
+            )
+            resp = client.chat.completions.create(
+                model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=[{"role": "system", "content": system_msg},
+                          {"role": "user", "content": user_msg}],
+                temperature=0.2,
+            )
+            text = resp.choices[0].message.content
+            return _strip_code_fences(text)
+
+    # Fallback template
+    return TEMPLATE_SPEC.format(prompt=prompt)
+
+
+def summarize_report(path: str) -> str:
+    try:
+        text = open(path, "r", encoding="utf-8").read()
+    except Exception as e:
+        return f"Error reading report: {e}"
+    client = _openai_client_or_none()
+    if client is None:
+        return "Executive Summary (stub): key model, metrics, top features summarized."
+    system_msg = "You write a concise, 4–6 sentence executive summary of ML experiment reports."
+    user_msg = f"Summarize this report for a technical audience:\n\n{text}"
+    resp = client.chat.completions.create(
+        model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        messages=[{"role": "system", "content": system_msg},
+                  {"role": "user", "content": user_msg}],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prompt", help="Free-text prompt to draft a YAML spec")
+    ap.add_argument("--report", help="Path to a generated report.md to summarize")
+    ap.add_argument("--out", help="Output file path (if omitted, prints to stdout)")
+    ap.add_argument("--csv", help="Optional CSV path to validate features/target against")
+    ap.add_argument("--no-llm", action="store_true", help="Disable LLM; use template only")
+    ap.add_argument("--show-warnings", action="store_true", help="Print validation warnings to stderr")
+    args = ap.parse_args()
+
+    if args.prompt:
+        # 1) Draft YAML
+        spec_text = draft_spec_from_prompt(args.prompt, use_llm=(not args.no_llm))
+        spec_text = _strip_code_fences(spec_text)
+
+        # 2) Parse -> repair -> validate basics
+        try:
+            raw = yaml.safe_load(spec_text) or {}
+            if not isinstance(raw, dict):
+                raw = {}
+        except Exception:
+            raw = {}
+
+        raw = _ensure_spec_shape(raw)
+        raw = _basic_validate_and_repair(raw)
+
+        # 3) Optional data-aware checks
+        warnings = _data_aware_checks(raw, csv_path_override=args.csv)
+        if args.show_warnings and warnings:
+            for w in warnings:
+                print(w, file=sys.stderr)
+
+        # 4) Dump final YAML
+        final_text = yaml.safe_dump(raw, sort_keys=False)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(final_text)
+            print(f"Wrote spec to {args.out}")
+        else:
+            print(final_text)
+        return
+
+    if args.report:
+        summary = summarize_report(args.report)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(summary + "\n")
+            print(f"Wrote summary to {args.out}")
+        else:
+            print(summary)
+        return
+
+    print(
+        "Usage:\n"
+        "  python aria_llm.py --prompt 'predict housing prices' --out analysis.spec.yaml [--csv data/housing.csv]\n"
+        "  python aria_llm.py --report runs/.../report.md [--out summary.txt]\n"
+        "Options:\n"
+        "  --no-llm           Use the built-in template instead of calling OpenAI\n"
+        "  --show-warnings    Print CSV validation warnings to stderr\n"
+    )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- Run examples:
+  - Draft spec (template): python aria_llm.py --prompt "predict housing prices" --no-llm --out analysis.spec.yaml
+  - Draft spec (LLM): set OPENAI_API_KEY, then python aria_llm.py --prompt "predict housing prices" --out analysis.spec.yaml
+  - Validate against CSV header: add --csv data/housing.csv --show-warnings
+  - Summarize report: python aria_llm.py --report runs/aria_demo/<ts>/artifacts/report.md --out summary.txt
+
+- The script ensures the YAML has the right keys, normalizes enums, and warns if target/features don’t exist in the CSV header.
