@@ -1,0 +1,33 @@
+run:
+  out_dir: ./runs/aria_demo
+  random_state: 42
+  test_size: 0.2
+  cv_folds: 5
+  task: regression   # or classification
+
+data:
+  csv_path: data/housing.csv
+  target: house_price
+  features:
+    - rooms
+    - distance
+    - crime_rate
+    - age
+    - income
+    - school_score
+    - has_park
+    - near_subway
+    - city
+
+constraints:
+  allow_models: ["linear", "gbdt", "rf"]
+  scale_numeric: true
+  handle_unknown_category: ignore
+
+explainability:
+  permutation_importance:
+    enabled: true
+    n_repeats: 5
+
+deliverables:
+  artifacts: ["model.pkl","metrics.json","feature_importance.png","lineage.json","report.md"]
